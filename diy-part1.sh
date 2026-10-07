@@ -21,7 +21,7 @@ mkdir -p "$PKG_DIR"
 # 温度不再用 luci-app-temp-status —— 由 autocore 的 /sbin/tempinfo 提供，
 # 见 files/sbin/tempinfo（概览页「温度」行：CPU / WiFi / PON 温度 + 光功率）
 # ---------------------------------------------------------
-ADD_AIROHA_NPU=true    # luci-app-airoha-npu：Airoha SoC 状态页（NPU/CPU/Frame Engine/PPE）
+ADD_AIROHA_NPU=false    # luci-app-airoha-npu：Airoha SoC 状态页（NPU/CPU/Frame Engine/PPE）
 
 ADD_PASSWALL=false     # luci-app-passwall（含依赖源）
 ADD_OPENCLASH=false    # luci-app-openclash ⚠ 依赖 Ruby/Rust，编译极慢
@@ -31,7 +31,7 @@ ADD_TAILSCALE=false    # luci-app-tailscale
 ADD_OPENLIST=false     # luci-app-openlist2（alist/openlist 挂载）
 ADD_SMARTDNS=false     # luci-app-smartdns
 
-ADD_LUCI_APP=true       # qwe3017/luci-app 仓库（monorepo）
+ADD_LUCI_APP=false       # qwe3017/luci-app 仓库（monorepo）
                         #   ├─ luci-app-natmode     NAT 类型三选一（网络 → NAT 类型）
                         #   └─ luci-app-pon-status  PON 光模块卡片（概览页「系统」下一格）
 
