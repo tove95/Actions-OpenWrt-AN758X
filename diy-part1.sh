@@ -35,6 +35,13 @@ ADD_LUCI_APP=ture       # qwe3017/luci-app 仓库（monorepo）
                         #   ├─ luci-app-natmode     NAT 类型三选一（网络 → NAT 类型）
                         #   └─ luci-app-pon-status  PON 光模块卡片（概览页「系统」下一格）
 
+ADD_ONU_CONFIG=true     # naoki66/OpenWrt_ONU_CONFIG：完整替换源码自带的
+                        #   PON 用户态栈 —— airoha-pond / airoha-ponctl /
+                        #   airoha-pon-debug 换实现，luci-app-pon ->
+                        #   luci-app-onu（顶级 ONU 菜单，吸收 luci-app-iptv），
+                        #   并应用 firewall4 流表卸载补丁。
+                        #   ⚠ 开启后 defconfig 前会删除源码同名旧包
+
 clone() {  # clone <url> <dir> [branch]
   local url="$1" dir="$2" br="$3"
   [ -d "$dir" ] && { echo "已存在，跳过: $dir"; return 0; }
@@ -217,6 +224,117 @@ for d in "$PKG_DIR"/*; do
   fi
 done
 
+# =========================================================
+# OpenWrt_ONU_CONFIG —— 完整替换源码自带的 PON 用户态栈
+#
+#   源码（ponwrt）自带旧版 pon_userspace：airoha-pond / airoha-ponctl /
+#   airoha-pon-debug / luci-app-pon / luci-app-iptv。OpenWrt_ONU_CONFIG 是
+#   同一套栈的重构版，包名与旧版重叠，故必须「先删旧包、再放新包」，否则
+#   buildroot 索引出现同名包，最终装进固件的是哪一个不确定。
+#
+#     旧                        新
+#     airoha-pond         ->    airoha-pond（换实现，包名不变）
+#     airoha-ponctl       ->    airoha-ponctl（换实现，包名不变）
+#     airoha-pon-debug    ->    airoha-pon-debug（换实现，包名不变）
+#     luci-app-pon        ->    luci-app-onu（改名并升为顶级菜单）
+#     luci-app-iptv       ->    （被 luci-app-onu 吸收）
+#
+#   另附 firewall4 补丁：让 zone 的 list device 也参与流表卸载，
+#   PPPoE/VLAN 上联的 PPE 硬件卸载依赖它。
+# =========================================================
+if [ "$ADD_ONU_CONFIG" = "true" ]; then
+  echo "=========================================="
+  echo "集成 OpenWrt_ONU_CONFIG（替换 PON 用户态栈）"
+  echo "=========================================="
+
+  ONU_URL="https://github.com/naoki66/OpenWrt_ONU_CONFIG"
+  ONU_TMP="$(mktemp -d)/OpenWrt_ONU_CONFIG"
+
+  if ! clone "$ONU_URL" "$ONU_TMP" main; then
+    echo "::error::OpenWrt_ONU_CONFIG 拉取失败，PON 用户态栈无法替换"
+    exit 1
+  fi
+
+  # ---------------------------------------------------------
+  # 1) 放入新包
+  #    airoha-pon-daemons 的 PKG_NAME 是 airoha-pon-daemons，但 BuildPackage
+  #    的包符号是 airoha-pond。目录名改成 airoha-pond 不影响构建（包名由
+  #    BuildPackage 显式给出），却能让下面「目录名即包名」的索引校验通过。
+  # ---------------------------------------------------------
+  for pair in \
+    "airoha-pon-daemons:airoha-pond" \
+    "airoha-ponctl:airoha-ponctl" \
+    "airoha-pon-debug:airoha-pon-debug" \
+    "luci-app-onu:luci-app-onu"; do
+    src="${pair%%:*}"
+    dst="${pair##*:}"
+    if [ ! -f "$ONU_TMP/$src/Makefile" ]; then
+      echo "::error::OpenWrt_ONU_CONFIG/$src/Makefile 缺失，无法加入编译"
+      exit 1
+    fi
+    rm -rf "$PKG_DIR/$dst"
+    cp -r "$ONU_TMP/$src" "$PKG_DIR/$dst"
+    echo "✅ 已拷贝: $src -> $PKG_DIR/$dst"
+  done
+
+  # ---------------------------------------------------------
+  # 2) 删除源码自带的同名旧包
+  #    旧包可能同时在：feeds 源目录、feeds install 建的符号链接、
+  #    package/ 下的实体目录。按目录名逐个清理，package/custom 除外。
+  # ---------------------------------------------------------
+  echo "--- 移除源码自带的旧 PON 用户态包 ---"
+  for name in airoha-pond airoha-pon-daemons airoha-ponctl airoha-pon-debug luci-app-pon luci-app-iptv; do
+    while IFS= read -r d; do
+      case "$d" in
+        "$PKG_DIR"/*) continue ;;
+      esac
+      rm -rf "$d"
+      echo "  🗑  已删除: $d"
+    done < <(find package feeds -maxdepth 5 \( -type d -o -type l \) -name "$name" 2>/dev/null)
+  done
+
+  # 目录名与包名不一致时，再按 Makefile 里的包定义定位一次。
+  for sym in 'BuildPackage,airoha-pond' 'BuildPackage,airoha-ponctl' 'BuildPackage,airoha-pon-debug'; do
+    while IFS= read -r m; do
+      d="$(dirname "$m")"
+      case "$d" in
+        "$PKG_DIR"/*) continue ;;
+      esac
+      rm -rf "$d"
+      echo "  🗑  已删除（按包定义 $sym）: $d"
+    done < <(grep -rl --include=Makefile -- "$sym" package feeds 2>/dev/null)
+  done
+
+  # ---------------------------------------------------------
+  # 3) 应用 firewall4 补丁
+  #    firewall4 的源可能在 package/ 或 feeds/；定位含
+  #    root/usr/share/ucode/fw4.uc 的包目录，用 -p1 打进源码。
+  # ---------------------------------------------------------
+  FW4_PATCH="$ONU_TMP/patches/firewall4/010-fw4-zone-device-flowtable.patch"
+  if [ -f "$FW4_PATCH" ]; then
+    FW4_UC="$(find package feeds -type f -path '*/root/usr/share/ucode/fw4.uc' 2>/dev/null | head -1)"
+    if [ -n "$FW4_UC" ]; then
+      FW4_DIR="${FW4_UC%/root/usr/share/ucode/fw4.uc}"
+      if grep -q 'zone_offload_devices' "$FW4_UC"; then
+        echo "✅ firewall4 补丁已应用，跳过（$FW4_DIR）"
+      elif command -v patch >/dev/null 2>&1; then
+        if ( cd "$FW4_DIR" && patch -p1 --forward --silent < "$FW4_PATCH" ); then
+          echo "✅ firewall4 补丁已应用: $FW4_DIR"
+        else
+          echo "::warning::firewall4 补丁应用失败（继续编译）: $FW4_DIR"
+        fi
+      else
+        echo "::warning::系统无 patch 命令，跳过 firewall4 补丁"
+      fi
+    else
+      echo "::warning::未找到 firewall4 源（root/usr/share/ucode/fw4.uc），跳过补丁"
+    fi
+  fi
+
+  rm -rf "$(dirname "$ONU_TMP")"
+  echo "🎉 OpenWrt_ONU_CONFIG 集成完毕"
+fi
+
 # ---------------------------------------------------------
 # 让新包进入索引
 #
@@ -288,6 +406,9 @@ if [ -n "$(ls -A "$PKG_DIR" 2>/dev/null)" ]; then
   if [ "$ADD_LUCI_APP" = "true" ]; then
     REQUIRED="$REQUIRED luci-app-natmode luci-app-pon-status"
   fi
+  # OpenWrt_ONU_CONFIG 的 PON 用户态栈（机型 config 里默认 =y，必须进索引）
+  [ "$ADD_ONU_CONFIG" = "true" ] && \
+    REQUIRED="$REQUIRED airoha-pond airoha-ponctl airoha-pon-debug luci-app-onu"
   HARD_MISS=""
   for r in $REQUIRED; do
     grep -qx "Package: $r" tmp/.packageinfo 2>/dev/null || HARD_MISS="$HARD_MISS $r"
