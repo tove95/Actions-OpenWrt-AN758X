@@ -676,7 +676,7 @@ jobs:
           # 这里显式确认 PON 核心链路还在，否则编出来光口不通
           # =========================================================
           MISSING=""
-          for p in kmod-airoha-xpon kmod-airoha-pon-frontend airoha-pond airoha-ponctl luci-app-pon; do
+          for p in kmod-airoha-xpon kmod-airoha-pon-frontend airoha-pond airoha-ponctl luci-app-onu; do
             if ! grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
               MISSING="$MISSING $p"
             fi
