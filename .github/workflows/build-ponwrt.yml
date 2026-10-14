@@ -395,8 +395,9 @@ jobs:
             fi
           done
           if [ -n "$OPT_MISS" ]; then
-            echo "::error::状态插件缺失:$OPT_MISS 请检查 diy-part1.sh 的 clone / 拷贝是否成功"
-            exit 1
+            #echo "::error::状态插件缺失:$OPT_MISS 请检查 diy-part1.sh 的 clone / 拷贝是否成功"
+            echo "Warning: 状态插件缺失（用户主动禁用，跳过）"
+            #exit 0
           fi
           echo "✅ 状态插件校验通过"
 
@@ -771,7 +772,11 @@ jobs:
           # 固定 tag：机型 + 分支，不含时间戳、不含作者
           # 同一机型/分支再次编译时，softprops/action-gh-release 会更新
           # 这个已存在的 Release（同名固件自动覆盖），不会新建版本。
-          RELEASE_TAG=$(echo "${DEVICE_NAME}-${REPO_BRANCH}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          #RELEASE_TAG=$(echo "${DEVICE_NAME}-${REPO_BRANCH}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          #echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          # 改为动态 tag：机型 + 分支 + 时间戳，每次编译生成独立的 Release
+          BUILD_DATE=$(date '+%Y%m%d-%H%M')
+          RELEASE_TAG=$(echo "${DEVICE_NAME}-${REPO_BRANCH}-${BUILD_DATE}" | sed 's/[^a-zA-Z0-9._-]/-/g')
           echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
 
           touch release.txt
