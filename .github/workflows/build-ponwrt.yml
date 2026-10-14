@@ -818,12 +818,9 @@ jobs:
           done
 
           # 清理下载失败残留的小文件，否则解压时报 "does not look like a tar archive"
-          # 注意：必须排除 dl/go-mod-cache（Go 模块缓存），否则会误删里面大量 <1KB 的
-          # 正常文件（.go/.info/.mod/.ziphash），导致编译报
-          # "no required module provides package ..." / "build constraints exclude all Go files"
           echo "--- 清理损坏的下载包 ---"
-          find dl -path 'dl/go-mod-cache' -prune -o -size -1024c -type f -exec ls -l {} \; 2>/dev/null
-          find dl -path 'dl/go-mod-cache' -prune -o -size -1024c -type f -exec rm -f {} \; 2>/dev/null
+          find dl -size -1024c -type f -exec ls -l {} \; 2>/dev/null
+          find dl -size -1024c -type f -exec rm -f {} \; 2>/dev/null
 
           echo "dl 目录共 $(ls -1 dl 2>/dev/null | wc -l) 个文件"
           ls -lh dl 2>/dev/null | head -20
@@ -1052,11 +1049,8 @@ jobs:
             sleep 5
           done
           # 清理下载失败残留的小文件
-          # 注意：必须排除 dl/go-mod-cache（Go 模块缓存），否则会误删里面大量 <1KB 的
-          # 正常文件（.go/.info/.mod/.ziphash），导致编译报
-          # "no required module provides package ..." / "build constraints exclude all Go files"
-          find dl -path 'dl/go-mod-cache' -prune -o -size -1024c -type f -exec ls -l {} \; 2>/dev/null
-          find dl -path 'dl/go-mod-cache' -prune -o -size -1024c -type f -exec rm -f {} \; 2>/dev/null
+          find dl -size -1024c -type f -exec ls -l {} \; 2>/dev/null
+          find dl -size -1024c -type f -exec rm -f {} \; 2>/dev/null
           echo "dl 目录共 $(ls -1 dl 2>/dev/null | wc -l) 个文件"
 
       # =========================================================
