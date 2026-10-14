@@ -30,7 +30,12 @@ ADD_LUCKY=false        # luci-app-lucky（DDNS + socat）
 ADD_TAILSCALE=false    # luci-app-tailscale
 ADD_OPENLIST=false     # luci-app-openlist2（alist/openlist 挂载）
 ADD_SMARTDNS=false     # luci-app-smartdns
-
+ADD_EASYTIER=false     # luci-app-easytier（另需 kmod-tun + easytier 本体，Rust 编译较慢）
+ADD_POWEROFF=false     # luci-app-poweroffdevice（关机）
+ADD_OWQ_WOL=false      # luci-app-owq-wol（网络唤醒，依赖 etherwake）
+ADD_WATCHDOG=false     # luci-app-watchdog（看门狗，包在子目录，需特殊处理）
+ADD_TASKPLAN=false     # luci-app-taskplan（定时任务）
+ADD_OAF=false          # luci-app-oaf（应用过滤，含内核模块，高风险）
 ADD_LUCI_APP=true       # qwe3017/luci-app 仓库（monorepo）
                         #   ├─ luci-app-natmode     NAT 类型三选一（网络 → NAT 类型）
                         #   └─ luci-app-pon-status  PON 光模块卡片（概览页「系统」下一格）
@@ -164,12 +169,36 @@ if [ "$ADD_OPENLIST" = "true" ]; then
   clone https://github.com/sbwml/luci-app-openlist2 "$PKG_DIR/luci-app-openlist2" main
 fi
 
-# --- smartdns ---
 if [ "$ADD_SMARTDNS" = "true" ]; then
   clone https://github.com/pymumu/luci-app-smartdns "$PKG_DIR/luci-app-smartdns" master
   clone https://github.com/pymumu/smartdns "$PKG_DIR/smartdns" master
 fi
-
+if [ "$ADD_EASYTIER" = "true" ]; then
+  clone https://github.com/EasyTier/luci-app-easytier "$PKG_DIR/luci-app-easytier" main
+fi
+if [ "$ADD_POWEROFF" = "true" ]; then
+  clone https://github.com/sirpdboy/luci-app-poweroffdevice "$PKG_DIR/luci-app-poweroffdevice" main
+fi
+if [ "$ADD_OWQ_WOL" = "true" ]; then
+  clone https://github.com/isalikai/luci-app-owq-wol "$PKG_DIR/luci-app-owq-wol" main
+fi
+if [ "$ADD_TASKPLAN" = "true" ]; then
+  clone https://github.com/sirpdboy/luci-app-taskplan "$PKG_DIR/luci-app-taskplan" main
+fi
+if [ "$ADD_WATCHDOG" = "true" ]; then   # 包在子目录，必须拷出子目录，不能整仓丢进去
+  WD_TMP="$(mktemp -d)/wd"
+  clone https://github.com/sirpdboy/luci-app-watchdog "$WD_TMP" main
+  rm -rf "$PKG_DIR/luci-app-watchdog"
+  cp -r "$WD_TMP/luci-app-watchdog" "$PKG_DIR/luci-app-watchdog"
+  rm -rf "$WD_TMP"
+fi
+if [ "$ADD_OAF" = "true" ]; then
+  clone https://github.com/destan19/OpenAppFilter "$PKG_DIR/OpenAppFilter" master
+  for p in luci-app-oaf open-app-filter oaf; do
+    cp -r "$PKG_DIR/OpenAppFilter/$p" "$PKG_DIR/" 2>/dev/null
+  done
+  rm -rf "$PKG_DIR/OpenAppFilter"
+fi
 # ---------------------------------------------------------
 # 校验：默认开启的两个插件必须拉到，否则 defconfig 会静默剔除，
 #       编出来的固件缺少状态页还不易察觉
