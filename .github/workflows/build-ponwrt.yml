@@ -18,6 +18,8 @@ env:
   UPLOAD_RELEASE: ${{ github.event.inputs.upload_release || 'true' }}
   USE_DL_CACHE: true
   USE_CCACHE: false
+  # SONiC fullcone NAT：应用内嵌的 sonic-fullcone/ 补丁集（全锥形 NAT）
+  APPLY_SONIC_FULLCONE: 'true'
   TZ: Asia/Shanghai
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   REPO_BRANCH: ${{ github.event.inputs.branch || 'master' }}
@@ -271,6 +273,20 @@ jobs:
           cd "$BUILD_ROOT/openwrt"
           chmod +x "$GITHUB_WORKSPACE/$DIY_P1_SH"
           "$GITHUB_WORKSPACE/$DIY_P1_SH"
+
+      # =========================================================
+      # 5.5 应用 SONiC fullcone NAT 补丁
+      #     在 feeds 安装之后、编译之前注入内核/iptables/nftables/
+      #     firewall4/LuCI 补丁，实现全锥形 NAT（Full Cone NAT）。
+      #     补丁集内嵌于仓库 sonic-fullcone/，无需联网克隆。
+      # =========================================================
+      - name: Apply SONiC fullcone NAT patches
+        if: env.APPLY_SONIC_FULLCONE == 'true'
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          chmod +x "$GITHUB_WORKSPACE/scripts/apply-sonic-fullcone.sh"
+          SONIC_FULLCONE_SRC="$GITHUB_WORKSPACE/sonic-fullcone" \
+            "$GITHUB_WORKSPACE/scripts/apply-sonic-fullcone.sh"
 
 
       # =========================================================
