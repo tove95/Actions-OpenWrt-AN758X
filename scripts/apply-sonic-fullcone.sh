@@ -1,51 +1,119 @@
 #!/usr/bin/env bash
 # ================================================================
-# apply-sonic-fullcone.sh
-#   Apply SONiC fullcone NAT patches to the OpenWrt source tree.
+# add_sonic_fullcone.sh
+#   Apply SONiC fullcone NAT patches to the OpenWrt source tree,
+#   for GitHub Actions cloud builds.
 #
-#   本脚本是 openwrt-sonic-fullcone 的「离线内嵌」版：
-#   上游 add_sonic_fullcone.sh 会在运行时 git clone 仓库，
-#   这里改为直接读取本仓库内嵌的 sonic-fullcone/ 补丁集，
-#   避免 CI 期间再次联网克隆第三方仓库。
+#   与上游 mufeng05/openwrt-sonic-fullcone 的 add_sonic_fullcone.sh
+#   行为一致：运行时 git clone 上游仓库获取补丁，再复制到源码树。
+#   在此基础上增加一段「移除源码树自带 fullcone」逻辑：
+#     ponwrt / immortalwrt 自带 kmod-nft-fullcone（独立 nft_fullcone.ko）
+#     及配套的 nftables / firewall4 / firewall3 补丁，与 sonic 的内核
+#     补丁（改 nf_nat_core / nft_masq）互斥，必须先整套拆除。
 #
-#   补丁作用点：
-#     target/linux/generic/hack-<kv>/   内核 fullcone（984/985/986）
-#     package/network/utils/iptables/   FULLCONE target（901）
-#     package/libs/libnftnl/            fullcone 表达式序列化（001）
-#     package/network/utils/nftables/   fullcone CLI 关键字（002）
-#     package/network/config/firewall4/ nftables/fw4 per-zone（001）
-#     package/network/config/firewall/  iptables/fw3 per-zone（001）
-#     feeds/luci/applications/luci-app-firewall/  LuCI 选项（001）
+#   用法（OpenWrt 源码根目录，feeds install -a 之后、编译之前）:
+#     cd /workdir/openwrt && bash /path/to/add_sonic_fullcone.sh
 #
-# 运行目录: OpenWrt 源码根目录（feeds install -a 之后、编译之前）
-#
-# 用法:
-#   cd /path/to/openwrt && \
-#     SONIC_FULLCONE_SRC=/path/to/sonic-fullcone \
-#     /path/to/apply-sonic-fullcone.sh
+#   可覆盖的环境变量:
+#     SONIC_FULLCONE_REPO   上游补丁仓库（默认 mufeng05/openwrt-sonic-fullcone）
+#     SONIC_FULLCONE_REF    上游分支/标签（默认 master）
+#     REMOVE_BUILTIN_FULLCONE  是否移除自带 fullcone（默认 1）
 # ================================================================
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# --- Check required tools ---
+for tool in git; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "Error: '$tool' is required but not found in PATH."
+        exit 1
+    fi
+done
 
-# 补丁源目录：优先环境变量，其次仓库内嵌的 sonic-fullcone/
-SRC="${SONIC_FULLCONE_SRC:-$SCRIPT_DIR/../sonic-fullcone}"
-
-# --- 校验补丁源 ---
-if [ ! -d "$SRC/kernel" ] || [ ! -d "$SRC/patches" ]; then
-    echo "Error: sonic-fullcone patches not found at: $SRC"
-    echo "       override with SONIC_FULLCONE_SRC=/path/to/sonic-fullcone"
-    exit 1
-fi
-
-# --- 校验运行目录是 OpenWrt 源码树 ---
+# --- Check environment ---
 if ! [ -d "./package" ] || ! [ -d "./target" ]; then
     echo "Error: please run this script from the root of an OpenWrt source tree."
     exit 1
 fi
 
-# --- 检测内核版本 ---
+# --- Clone repo to temp dir ---
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+REPO="${SONIC_FULLCONE_REPO:-https://github.com/mufeng05/openwrt-sonic-fullcone}"
+REF="${SONIC_FULLCONE_REF:-master}"
+SRC="$TMPDIR/sonic-fullcone"
+
+echo "Cloning $REPO (branch: $REF) ..."
+clone_ok=0
+for attempt in 1 2 3; do
+    if git clone --depth=1 --single-branch -b "$REF" "$REPO" "$SRC" 2>&1; then
+        clone_ok=1
+        break
+    fi
+    echo "::warning::git clone 第 $attempt 次失败，5 秒后重试"
+    rm -rf "$SRC"
+    sleep 5
+done
+if [ "$clone_ok" != "1" ]; then
+    echo "Error: failed to clone $REPO after 3 attempts."
+    echo "Check your network connection (GitHub 偶发 443 超时) and retry."
+    exit 1
+fi
+
+# --- Verify patch source ---
+if [ ! -d "$SRC/kernel" ] || [ ! -d "$SRC/patches" ]; then
+    echo "Error: cloned repo does not contain the expected kernel/ and patches/ directories."
+    exit 1
+fi
+
+# =========================================================
+# 移除源码树自带的 fullcone（与 sonic 互斥）
+#
+#   ponwrt / immortalwrt 自带的满锥实现：
+#     - fullconenat-nft   独立内核模块 nft_fullcone.ko（kmod-nft-fullcone）
+#     - fullconenat       xt_FULLCONENAT（kmod-ipt-fullconenat）
+#     - nftables / firewall4 / firewall3 配套补丁
+#   与 sonic（改 nf_nat_core / nft_masq）是两套互斥实现：
+#     · nftables 补丁同名，会被下面 cp -f 覆盖；
+#     · firewall4/firewall3 补丁改同一批文件，hunk 重叠 → 第二个必失败。
+#   故先整套拆除，让 sonic 成为唯一 fullcone 实现。
+# =========================================================
+REMOVE_BUILTIN_FULLCONE="${REMOVE_BUILTIN_FULLCONE:-1}"
+if [ "$REMOVE_BUILTIN_FULLCONE" = "1" ]; then
+    echo "=== 移除自带 fullcone（避免与 sonic 冲突）==="
+    removed=0
+    for d in \
+        "./package/network/utils/fullconenat-nft" \
+        "./package/network/utils/fullconenat"; do
+        if [ -d "$d" ]; then
+            rm -rf "$d"
+            echo "[remove]    源码包已删除: $d"
+            removed=$((removed + 1))
+        fi
+    done
+    for f in \
+        "./package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch" \
+        "./package/network/config/firewall4/patches/001-firewall4-add-support-for-fullcone-nat.patch" \
+        "./package/network/config/firewall/patches/fullconenat.patch"; do
+        if [ -f "$f" ]; then
+            rm -f "$f"
+            echo "[remove]    补丁已删除: $f"
+            removed=$((removed + 1))
+        fi
+    done
+    echo "[remove]    共移除 $removed 项自带 fullcone"
+
+    # 强制重建包索引：diy-part1.sh 已生成过含 kmod-nft-fullcone 的
+    # tmp/.packageinfo，清掉 stamp 让后续 make defconfig 重新扫描，
+    # 避免残留的自带 fullcone 包符号被二次 defconfig 带回。
+    if [ "$removed" -gt 0 ]; then
+        rm -f tmp/.packageinfo tmp/.targetinfo tmp/.config-package.in tmp/.config-target.in
+        rm -f tmp/info/.scan-packageinfo.stamp tmp/info/.scan-targetinfo.stamp
+    fi
+fi
+
+# --- Detect kernel versions ---
 kernel_versions=""
 for f in ./include/kernel-[0-9]*; do
     [ -f "$f" ] && kernel_versions="$kernel_versions $(basename "$f" | sed 's/kernel-//')"
