@@ -104,6 +104,30 @@ if [ "$REMOVE_BUILTIN_FULLCONE" = "1" ]; then
     done
     echo "[remove]    共移除 $removed 项自带 fullcone"
 
+    # 剥离 firewall4 / firewall(fw3) Makefile 里对已删包的内核依赖。
+    # 仅仅删包、改 .config 还不够：DEPENDS 是硬依赖，apk 安装阶段会报
+    #   kmod-nft-fullcone (no such package):
+    #     required by: firewall4-2025.03.17~b6e51575-r4[kmod-nft-fullcone]
+    # sonic 的 fullcone 编进现有 kmod-nft-nat（nft_masq），无需独立包。
+    fw4_mk="./package/network/config/firewall4/Makefile"
+    if [ -f "$fw4_mk" ] && grep -q 'kmod-nft-fullcone' "$fw4_mk"; then
+        sed -i 's/ +kmod-nft-fullcone//g' "$fw4_mk"
+        echo "[remove]    firewall4 依赖已剥离: +kmod-nft-fullcone"
+    fi
+    fw3_mk="./package/network/config/firewall/Makefile"
+    if [ -f "$fw3_mk" ] && grep -q 'iptables-mod-fullconenat' "$fw3_mk"; then
+        sed -i 's/ +iptables-mod-fullconenat//g' "$fw3_mk"
+        echo "[remove]    firewall(fw3) 依赖已剥离: +iptables-mod-fullconenat"
+    fi
+
+    # 兜底：若还有其它组件依赖已删的 fullcone 包，打印告警便于排查
+    for mf in $(grep -rl --include=Makefile 'kmod-nft-fullcone\|iptables-mod-fullconenat' package/ 2>/dev/null); do
+        case "$mf" in
+            ./package/network/config/firewall4/Makefile|./package/network/config/firewall/Makefile) continue ;;
+        esac
+        echo "[remove]    ::warning::仍有组件依赖已删的 fullcone 包: $mf"
+    done
+
     # 强制重建包索引：diy-part1.sh 已生成过含 kmod-nft-fullcone 的
     # tmp/.packageinfo，清掉 stamp 让后续 make defconfig 重新扫描，
     # 避免残留的自带 fullcone 包符号被二次 defconfig 带回。
