@@ -18,8 +18,8 @@ env:
   UPLOAD_RELEASE: ${{ github.event.inputs.upload_release || 'true' }}
   USE_DL_CACHE: true
   USE_CCACHE: false
-  # SONiC fullcone NAT：应用内嵌的 sonic-fullcone/ 补丁集（全锥形 NAT）
-  APPLY_SONIC_FULLCONE: 'true'
+  # SONiC fullcone NAT：运行时 git clone 上游补丁仓库，替换自带 fullcone
+  APPLY_SONIC_FULLCONE: ${{ github.event.inputs.sonic_fullcone || 'true' }}
   TZ: Asia/Shanghai
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   REPO_BRANCH: ${{ github.event.inputs.branch || 'master' }}
@@ -96,6 +96,14 @@ on:
         default: 'qwe'
       upload_release:
         description: '固件发布到 Release（false 则只传 Artifact）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      sonic_fullcone:
+        description: 'SONiC fullcone NAT（true=克隆上游补丁替换自带 fullcone；false=保留自带 kmod-nft-fullcone）'
         required: false
         default: 'true'
         type: choice
@@ -278,15 +286,16 @@ jobs:
       # 5.5 应用 SONiC fullcone NAT 补丁
       #     在 feeds 安装之后、编译之前注入内核/iptables/nftables/
       #     firewall4/LuCI 补丁，实现全锥形 NAT（Full Cone NAT）。
-      #     补丁集内嵌于仓库 sonic-fullcone/，无需联网克隆。
+      #     add_sonic_fullcone.sh 运行时 git clone 上游补丁仓库
+      #     (mufeng05/openwrt-sonic-fullcone)，再复制补丁到源码树；
+      #     同时先移除 ponwrt/immortalwrt 自带的 fullcone，避免冲突。
       # =========================================================
-      - name: Apply SONiC fullcone NAT patches
+      - name: Apply SONiC fullcone NAT patches (git clone upstream)
         if: env.APPLY_SONIC_FULLCONE == 'true'
         run: |
           cd "$BUILD_ROOT/openwrt"
-          chmod +x "$GITHUB_WORKSPACE/scripts/apply-sonic-fullcone.sh"
-          SONIC_FULLCONE_SRC="$GITHUB_WORKSPACE/sonic-fullcone" \
-            "$GITHUB_WORKSPACE/scripts/apply-sonic-fullcone.sh"
+          chmod +x "$GITHUB_WORKSPACE/scripts/add_sonic_fullcone.sh"
+          "$GITHUB_WORKSPACE/scripts/add_sonic_fullcone.sh"
 
 
       # =========================================================
@@ -358,6 +367,7 @@ jobs:
           FW_AUTHOR="$FW_AUTHOR" FW_BUILD_TIME="$FW_BUILD_TIME" FW_DESC_SUFFIX="$FW_DESC_SUFFIX" \
           WIFI_5G_COUNTRY="$WIFI_5G_COUNTRY" WIFI_5G_CHANNEL="$WIFI_5G_CHANNEL" \
           WIFI_5G_HTMODE="$WIFI_5G_HTMODE" WIFI_5G_FALLBACK="$WIFI_5G_FALLBACK" \
+          APPLY_SONIC_FULLCONE="$APPLY_SONIC_FULLCONE" \
             "$GITHUB_WORKSPACE/$DIY_P2_SH"
 
       # =========================================================
