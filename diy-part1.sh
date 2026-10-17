@@ -22,7 +22,9 @@ mkdir -p "$PKG_DIR"
 # 见 files/sbin/tempinfo（概览页「温度」行：CPU / WiFi / PON 温度 + 光功率）
 # ---------------------------------------------------------
 ADD_AIROHA_NPU=true    # luci-app-airoha-npu：Airoha SoC 状态页（NPU/CPU/Frame Engine/PPE）
-
+ADD_FLUENT=true       # luci-theme-fluent：Fluent 2 风格主题
+ADD_FLUENT_LITE=false  # luci-theme-fluent-lite：轻量版（与 fluent 互斥，二选一）
+ADD_FLUENT_DASH=false  # luci-mod-fluentdashboard：可选状态概览卡片
 ADD_PASSWALL=false     # luci-app-passwall（含依赖源）
 ADD_OPENCLASH=false    # luci-app-openclash ⚠ 依赖 Ruby/Rust，编译极慢
 ADD_MOSDNS=false       # luci-app-mosdns + v2ray-geodata
@@ -173,6 +175,27 @@ if [ "$ADD_SMARTDNS" = "true" ]; then
   clone https://github.com/pymumu/luci-app-smartdns "$PKG_DIR/luci-app-smartdns" master
   clone https://github.com/pymumu/smartdns "$PKG_DIR/smartdns" master
 fi
+# --- luci-theme-fluent ---
+# ⚠ 包在仓库的 package/ 子目录下，不能直接 clone 到 package/custom，
+#   必须把子目录拷出来，否则 buildroot 扫不到 Makefile
+if [ "$ADD_FLUENT" = "true" ] || [ "$ADD_FLUENT_LITE" = "true" ] || [ "$ADD_FLUENT_DASH" = "true" ]; then
+  FLUENT_TMP="$(mktemp -d)/fluent"
+  clone https://github.com/LazuliKao/luci-theme-fluent "$FLUENT_TMP" main
+
+  for p in luci-theme-fluent luci-theme-fluent-lite luci-mod-fluentdashboard; do
+    case "$p" in
+      luci-theme-fluent)        [ "$ADD_FLUENT" = "true" ] || continue ;;
+      luci-theme-fluent-lite)   [ "$ADD_FLUENT_LITE" = "true" ] || continue ;;
+      luci-mod-fluentdashboard) [ "$ADD_FLUENT_DASH" = "true" ] || continue ;;
+    esac
+    [ -d "$FLUENT_TMP/package/$p" ] || { echo "::error::$p 不存在"; continue; }
+    rm -rf "$PKG_DIR/$p"
+    cp -a "$FLUENT_TMP/package/$p" "$PKG_DIR/$p"
+    echo "✅ 已拷贝: $p"
+  done
+  rm -rf "$FLUENT_TMP"
+fi
+
 if [ "$ADD_EASYTIER" = "true" ]; then
   clone https://github.com/EasyTier/luci-app-easytier "$PKG_DIR/luci-app-easytier" main
 fi
