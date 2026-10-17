@@ -826,7 +826,7 @@ jobs:
             echo '```'
             echo ""
             echo "---"
-            echo "> 本 Release 为滚动发布页，仅保留最新一次编译产物。"
+            #echo "> 本 Release 为滚动发布页，仅保留最新一次编译产物。"
             echo "> 安装前请用 AN758x-Stock2UBI 备份原厂 flash，刷机后恢复 PON/校准数据。"
           } >> release.txt
           echo "status=success" >> "$GITHUB_OUTPUT"
