@@ -819,6 +819,7 @@ jobs:
             echo "| 分支 | \`${REPO_BRANCH}\` |"
             echo "| 提交 | \`$(cd "$BUILD_ROOT"/openwrt && git rev-parse --short HEAD)\` |"
             echo "| 编译时间 | $(date '+%Y-%m-%d %H:%M:%S') (Shanghai) |"
+            echo "| 管理IP地址： | 192.168.5.1 |"
             echo ""
             echo "### 固件文件校验"
             echo '```'
