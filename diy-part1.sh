@@ -42,6 +42,13 @@ ADD_OAF=false          # luci-app-oaf（应用过滤，含内核模块，高风�
 ADD_LUCI_APP=true       # qwe3017/luci-app 仓库（monorepo）
                         #   ├─ luci-app-natmode     NAT 类型三选一（网络 → NAT 类型）
                         #   └─ luci-app-pon-status  PON 光模块卡片（概览页「系统」下一格）
+ADD_FTTR=true           # luci-app-fttr：FTTR 管理界面（网络 → FTTR）★仅 HM2004-DU
+ADD_FMCS_FW=true        # h3c-fmcs-firmware：HM2004-DU Micro-OLT FPGA 比特流 ★仅 HM2004-DU
+
+# 上面两个包只对 HM2004-DU 有意义：一个管 FTTR 主从设备，一个装的就是
+# 这颗 FPGA 的 bitstream。workflow 会把 PROFILE 导出成环境变量，非 2004
+# 机型直接跳过，不白花 clone 时间；本地手工跑（PROFILE 为空）按 2004 处理。
+FTTR_PROFILE="${PROFILE:-h3c_hm2004-du}"
 
 clone() {  # clone <url> <dir> [branch]
   local url="$1" dir="$2" br="$3"
@@ -88,6 +95,60 @@ if [ "$ADD_LUCI_APP" = "true" ]; then
   done
 
   rm -rf "$LUCI_APP_TMP"
+fi
+
+
+if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
+  FTTR_TMP="$(mktemp -d)/fttr"
+  if ! clone https://github.com/LazuliKao/luci-app-fttr "$FTTR_TMP" main; then
+    echo "::error::luci-app-fttr 拉取失败，config 里的 =y 会被 defconfig 剔除"
+    exit 1
+  fi
+  if [ ! -f "$FTTR_TMP/package/luci-app-fttr/Makefile" ]; then
+    echo "::error::$FTTR_TMP/package/luci-app-fttr/Makefile 不存在（上游改结构了？）"
+    exit 1
+  fi
+
+  rm -rf "$PKG_DIR/luci-app-fttr"
+  cp -a "$FTTR_TMP/package/luci-app-fttr" "$PKG_DIR/luci-app-fttr"
+
+  chmod 0755 "$PKG_DIR/luci-app-fttr/root/usr/libexec/fttr-hl202" \
+             "$PKG_DIR/luci-app-fttr/root/usr/libexec/rpcd/luci.fttr" 2>/dev/null || true
+
+  echo "✅ 已拷贝: luci-app-fttr (版本 $(grep -m1 '^PKG_VERSION' "$PKG_DIR/luci-app-fttr/Makefile" 2>/dev/null | sed 's/PKG_VERSION:=//'))"
+  rm -rf "$FTTR_TMP"
+fi
+
+if [ "$ADD_FMCS_FW" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
+  FMCS_TMP="$(mktemp -d)/luci-app"
+  if ! clone https://github.com/qwe-qaq/luci-app "$FMCS_TMP" main; then
+    echo "::error::qwe-qaq/luci-app 拉取失败，h3c-fmcs-firmware 会被 defconfig 剔除"
+    exit 1
+  fi
+  if [ ! -f "$FMCS_TMP/h3c-fmcs-firmware/Makefile" ]; then
+    echo "::error::$FMCS_TMP/h3c-fmcs-firmware/Makefile 不存在"
+    exit 1
+  fi
+
+  rm -rf "$PKG_DIR/h3c-fmcs-firmware"
+  cp -a "$FMCS_TMP/h3c-fmcs-firmware" "$PKG_DIR/h3c-fmcs-firmware"
+
+
+  find "$PKG_DIR/h3c-fmcs-firmware/files" -type f ! -name 'FTTR_TOP.sbit' -print -delete 2>/dev/null
+  SBIT="$PKG_DIR/h3c-fmcs-firmware/files/FTTR_TOP.sbit"
+  if [ ! -f "$SBIT" ]; then
+    echo "::error::$SBIT 缺失，包 install 时会失败"
+    exit 1
+  fi
+  SBIT_SIZE="$(stat -c%s "$SBIT")"
+  if [ "$SBIT_SIZE" -lt 1000000 ]; then
+    echo "::error::FTTR_TOP.sbit 只有 ${SBIT_SIZE} 字节（正常 2087000），文件异常"
+    exit 1
+  fi
+  echo "   FTTR_TOP.sbit: ${SBIT_SIZE} 字节 sha256=$(sha256sum "$SBIT" | cut -c1-16)…"
+
+  echo "✅ 已拷贝: h3c-fmcs-firmware"
+  rm -rf "$FMCS_TMP"
 fi
 
 # --- Airoha SoC 状态页（NPU 卸载 / CPU 频率 / Frame Engine / PPE 流表）---
@@ -345,6 +406,25 @@ if [ -n "$(ls -A "$PKG_DIR" 2>/dev/null)" ]; then
   [ "$ADD_AIROHA_NPU" = "true" ] && REQUIRED="$REQUIRED luci-app-airoha-npu"
   if [ "$ADD_LUCI_APP" = "true" ]; then
     REQUIRED="$REQUIRED luci-app-natmode luci-app-pon-status"
+  fi
+  if [ "$ADD_FMCS_FW" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
+    REQUIRED="$REQUIRED h3c-fmcs-firmware"
+  fi
+  if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
+    REQUIRED="$REQUIRED luci-app-fttr"
+    # =========================================================
+    # luci-app-fttr 的 LUCI_DEPENDS 里有 +h3c-fttr-tools（fttrctl 后端）。
+    # 这个包目前不在 ImmortalWrt feeds，也不在 pon_drivers / pon_userspace，
+    # 树里没有它，defconfig 一定把 luci-app-fttr 剔掉 —— 与其编出一个
+    # 「没有 FTTR 界面」的固件还不易察觉，不如在这里直接报错。
+    # 不需要这个界面就把上面的 ADD_FTTR 改成 false（clone 和校验一起停）。
+    # =========================================================
+    if ! grep -qx "Package: h3c-fttr-tools" tmp/.packageinfo 2>/dev/null; then
+      echo "::error::luci-app-fttr 依赖的后端 h3c-fttr-tools 不在包索引里（fttrctl / ucode 运行时）"
+      echo "        请先把 h3c-fttr-tools 放进源码树或 feeds 再编；"
+      echo "        暂时不需要 FTTR 界面就把 diy-part1.sh 的 ADD_FTTR 改成 false。"
+      exit 1
+    fi
   fi
   HARD_MISS=""
   for r in $REQUIRED; do
