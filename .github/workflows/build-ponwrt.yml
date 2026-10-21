@@ -723,8 +723,10 @@ jobs:
         run: |
           cd "$BUILD_ROOT/openwrt"
           # 可用内存(MiB) / 2GiB 每 job，下限 1、上限 nproc
-          JOBS=$(awk -v p="$(nproc)" '/^MemAvailable:/{m=int($2/2097152)+1} END{print m<p?m:p}' /proc/meminfo)
-          JOBS=$(( JOBS < 1 ? 1 : JOBS ))
+          #JOBS=$(awk -v p="$(nproc)" '/^MemAvailable:/{m=int($2/2097152)+1} END{print m<p?m:p}' /proc/meminfo)
+          #JOBS=$(( JOBS < 1 ? 1 : JOBS ))
+          # 编译线程 = 实际 CPU 核心数
+          JOBS=$(nproc)
           echo "开始编译 (${JOBS} 线程) / 机型: ${PROFILE}"
           df -hT /
 
