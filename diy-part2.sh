@@ -249,4 +249,10 @@ if [ -f "$OSREL_TPL" ]; then
   echo "✅ os-release 同步 -> $OSREL_LINE"
 fi
 
+# 用 -f 不要用 -x：git checkout / Windows 打包会丢可执行位，-x 判失败会静默整段跳过。
+# 末尾 || true：本文件开头是 set -euo pipefail，被 source 的子脚本里任何一步
+# 返回非 0 都会让这里当场退出，后面的步骤全不执行且整轮构建中断。
+# 加密是可选增强，不该有能力搞挂构建。
+[ -f scripts/diy-part2-crypto.sh ] && . ./scripts/diy-part2-crypto.sh || true
+
 echo "🎉 diy-part2.sh 执行完毕 (author=$FW_AUTHOR)"

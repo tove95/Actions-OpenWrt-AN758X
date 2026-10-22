@@ -255,3 +255,77 @@ endif
 2. 再跑一次 `scope = firmware` 出固件；
 3. 若仍超时，把 `configs/*.config` 里不需要的 luci-app / 语言包删掉再提交。
 
+---
+
+## AN758X 加密加速可选包
+
+### 三个开关怎么选
+
+| 开关 | 默认 | 什么时候开 | 谁受益 |
+|---|---|---|---|
+| `OPT_CRYPTO_ARM64CE` | 0（建议改 1） | 几乎总是开 | IPSec、OpenVPN、TLS、dm-crypt |
+| `OPT_CRYPTO_CHACHA` | 0（建议改 1） | 跑 Xray / sing-box / WireGuard | 出海类代理流量 |
+| `OPT_CRYPTO_EIP93` | 0 | 只在跑大块 IPSec / 大文件 TLS | 反而是最不需要的那个 |
+
+### 为什么这么分
+
+**AN7581 和 AN7583 不一样**，这是整个事情的关键：
+
+- AN7581（ZN504XG-D、XG-040G-MD 等）`/proc/cpuinfo` 里**没有 `aes`**，`/proc/crypto` 只有 `aes-generic`，单核 AES-128-GCM 约 32 MB/s。它只能走 NEON 位切片（`AES_ARM64_BS`）。
+- AN7583（XG-040G-MF）**有 `aes pmull sha1 sha2`**，同样测试能到约 548 MB/s，可以走 Crypto Extensions（`AES_ARM64_CE`）。
+
+脚本会自动读 `.config` 判断 SoC，分别写两套内核符号，不用你手动切。
+
+**EIP93 是个陷阱。** AN7581 确实内置了 EIP93（`crypto@1e004000`），驱动也在主线 `inside-secure/eip93` 里。但在 W1700K2（AN7581）上实测：AES 要 512 字节以上才比软件快，而 MD5 / SHA1 / SHA2 在所有尺寸下都是软件更快（阈值 -1）。代理流量几乎全是大大小小的包，开了只会更慢。所以默认关。
+
+**ChaCha 才是出海的正解。** Xray、sing-box 的 AEAD 优先用 ChaCha20-Poly1305，它不吃 AES 指令——你可以显式把 method 设成 `chacha20-ietf-poly1305`，比在 AN7581 上硬跑 AES 划算得多。
+
+### 安装
+
+1. 把 `01-diy-part2-crypto.sh` 放到 `scripts/` 下（或整体追加到 `diy-part2.sh` 末尾）。
+   若放 `scripts/`，在 `diy-part2.sh` 末尾加一行：
+
+   ```sh
+   [ -f scripts/diy-part2-crypto.sh ] && . ./scripts/diy-part2-crypto.sh
+   ```
+
+2. 把 `02-workflow-inputs.yml` 里的 inputs 合并进你的 `.github/workflows/*.yml`。
+   **只加 inputs 不够，必须同时加 `env:` 那段**，否则脚本读到的永远是 0。
+
+3. 不想动 workflow 也能用：直接在 workflow 的 `env:` 里写死
+
+   ```yaml
+   env:
+     OPT_CRYPTO_ARM64CE: '1'
+     OPT_CRYPTO_CHACHA: '1'
+     OPT_CRYPTO_EIP93: '0'
+   ```
+
+### 刷完后验证
+
+```sh
+# 1. 看指令集（AN7581 不会有 aes，AN7583 会有）
+grep -ao 'aes\|pmull\|sha1\|sha2' /proc/cpuinfo | sort -u
+
+# 2. 看内核注册了哪些实现
+cat /proc/crypto | grep -E '^name|^driver|^priority'
+
+# 3. 跑分对比
+openssl speed -evp aes-128-gcm
+openssl speed -evp chacha20-poly1305
+```
+
+开 `OPT_CRYPTO_EIP93` 后额外看一眼是否真的挂上了：
+
+```sh
+dmesg | grep -i eip93
+lsmod | grep eip93
+```
+
+### 注意事项
+
+- `CONFIG_CRYPTO_*` 是**内核编译符号**，必须写进 `target/linux/airoha/an7581/config-<kver>`。写进顶层 `.config` 会被 target config 覆盖，看起来配置成功了实际不生效——脚本里就是这么处理的。
+- `kmod-crypto-hw-eip93` 的依赖是 `@(TARGET_ramips_mt7621||TARGET_airoha)`，airоha 全系可编。内核 ≥6.18 走主线 in-tree 驱动（`inside-secure/eip93`），<6.18 走 `mtk-eip93`，包会自动选，你不用管。
+- Xray / sing-box 本身不在官方 feed，得先在 `feeds.conf.default` 加第三方源。用户态加密提速靠 ChaCha，不是靠 EIP93。
+- NPU 只在三层路由模式生效，当纯 AP 桥接时整机吞吐会掉到 2000 Mbps 左右——这跟加密无关，但经常一起被误判。
+

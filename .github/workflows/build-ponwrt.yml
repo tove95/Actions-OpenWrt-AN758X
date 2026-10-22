@@ -28,6 +28,27 @@ env:
   IGNORE_CACHE: ${{ github.event.inputs.ignore_cache || 'false' }}
   FW_BUILD_TIME: ''                 # 留空 = 自动取构建时时间（Asia/Shanghai）
   FW_DESC_SUFFIX: ''               # 留空 = "· qwe · <构建时间>"；填了则完全自定义
+
+  # =========================================================
+  # 加密加速开关（★ 本次新增，写在这里才是 workflow 级 env）
+  #
+  # ⚠ 用 github.event.inputs 而不是 inputs：本文件可被 repository_dispatch
+  #   触发，那种触发下 inputs 上下文不可靠，而文件里其余 env 项（SOURCE /
+  #   REPO_URL / BUILD_SCOPE…）统一都用 github.event.inputs，保持一致。
+  #
+  # ⚠ 默认值不能用 "|| " 兜：GitHub 表达式里字符串 '0' 会被转成数字 0 判为假，
+  #   `${{ github.event.inputs.x || '1' }}` 在用户显式选 0 时会错误地返回 '1'。
+  #
+  # ⚠ 也不能用 "!= '0'" 兜：本文件有 repository_dispatch 触发器，那种触发下
+  #   github.event.inputs.* 为 null，null 在字符串比较里被当成空串 ''，
+  #   '' != '0' 成立 → 返回 '1'。也就是说声明的 default: '0' 完全失效，
+  #   repository_dispatch / API 重跑时开关会被静默打开。
+  #   三个开关统一用 "== '1'"：只有显式传 '1' 才开，其余（0 / 空 / null）全关。
+  # =========================================================
+  OPT_CRYPTO_ARM64CE: ${{ github.event.inputs.opt_arm64ce == '1' && '1' || '0' }}
+  OPT_CRYPTO_CHACHA:  ${{ github.event.inputs.opt_chacha  == '1' && '1' || '0' }}
+  OPT_CRYPTO_EIP93:   ${{ github.event.inputs.opt_eip93   == '1' && '1' || '0' }}
+
   # ---- FTTR 相关仓库 ----
   # 填 none = 本次不拉这些仓库，FTTR 相关包整体跳过
   # 两个仓库的可见性不保证一致（当前：luci 公开、后端私有），所以运行时
@@ -80,6 +101,38 @@ on:
           - nokia_xg-040g-mf
           - nokia_xg-040g-mf-ubi
           - all
+
+      # ---------- 加密加速开关 ----------
+      # 用 choice 而不是 boolean：本文件其余开关（scope / ignore_cache /
+      # upload_release / ssh）一律是 choice + 字符串，保持一致；且 boolean
+      # 输入在 API 重跑 / repository_dispatch 时拿不到值，会退化成空串。
+      opt_arm64ce:
+        description: 'arm64 汇编加密实现（AN7581 走 NEON 位切片 / AN7583 走 CE，按 SoC 自动选）'
+        required: false
+        default: '0'
+        type: choice
+        options:
+          - '0'
+          - '1'
+
+      opt_chacha:
+        description: 'ChaCha20-Poly1305 NEON（Xray / sing-box / WireGuard 推荐）。注：机型 configs 里 chacha20 三个包本就默认 =y，此开关主要额外带 gcm/ccm/ctr/xts'
+        required: false
+        default: '0'
+        type: choice
+        options:
+          - '0'
+          - '1'
+
+      opt_eip93:
+        description: 'EIP93 硬件加密引擎（仅大块 IPSec / 大文件 TLS 有收益，小包更慢）'
+        required: false
+        default: '0'
+        type: choice
+        options:
+          - '0'
+          - '1'
+
       scope:
         description: '构建范围 (toolchain-only 仅预热工具链缓存)'
         required: true
@@ -200,6 +253,7 @@ jobs:
           echo "Branch   : ${REPO_BRANCH}"
           echo "Scope    : ${BUILD_SCOPE}"
           echo "Author   : ${FW_AUTHOR}"
+          echo "Crypto   : ARM64CE=${OPT_CRYPTO_ARM64CE} CHACHA=${OPT_CRYPTO_CHACHA} EIP93=${OPT_CRYPTO_EIP93}"
           echo "========================================"
 
       # =========================================================
@@ -265,6 +319,12 @@ jobs:
           # 输入项为空时回退到 workflow 级默认值，确保 diy-part2.sh 拿到的
           # 始终是确定值，而不是空串（空串会让 LuCI 概览页显示 "·  ·"）。
           echo "FW_AUTHOR=${FW_AUTHOR:-qwe}" >> "$GITHUB_ENV"
+
+          # 加密开关同样固化一遍：写进 GITHUB_ENV 后，即便哪天 workflow 级
+          # env 表达式改了，本 job 后续步骤读到的仍是本次解析出的确定值。
+          echo "OPT_CRYPTO_ARM64CE=${OPT_CRYPTO_ARM64CE}" >> "$GITHUB_ENV"
+          echo "OPT_CRYPTO_CHACHA=${OPT_CRYPTO_CHACHA}" >> "$GITHUB_ENV"
+          echo "OPT_CRYPTO_EIP93=${OPT_CRYPTO_EIP93}" >> "$GITHUB_ENV"
 
           cd openwrt && echo "commit: $(git rev-parse --short HEAD)"
 
@@ -597,6 +657,9 @@ jobs:
 
       # =========================================================
       # 8. diy-part2.sh —— 时区改为中国、写入固件版本后缀
+      #     ★ 加密可选包就在这一步注入（diy-part2.sh 末尾 source 我们的脚本）。
+      #       必须早于步骤 9 的 make defconfig，否则内核符号写完就被
+      #       defconfig 重新展开覆盖掉了。
       # =========================================================
       - name: Set timezone to China (diy-part2.sh)
         run: |
@@ -606,6 +669,12 @@ jobs:
           WIFI_5G_COUNTRY="$WIFI_5G_COUNTRY" WIFI_5G_CHANNEL="$WIFI_5G_CHANNEL" \
           WIFI_5G_HTMODE="$WIFI_5G_HTMODE" WIFI_5G_FALLBACK="$WIFI_5G_FALLBACK" \
             "$GITHUB_WORKSPACE/$DIY_P2_SH"
+
+          # 可选包是否被 defconfig 接受，要等步骤 9 之后才知道；
+          # 这里先记下期望值，步骤 9 末尾做一次对照。
+          echo "WANT_ARM64CE=${OPT_CRYPTO_ARM64CE}" >> "$GITHUB_ENV"
+          echo "WANT_CHACHA=${OPT_CRYPTO_CHACHA}"   >> "$GITHUB_ENV"
+          echo "WANT_EIP93=${OPT_CRYPTO_EIP93}"     >> "$GITHUB_ENV"
 
       # =========================================================
       # 9. defconfig + 生成工具链缓存 Key + 校验机型
@@ -666,6 +735,36 @@ jobs:
           # 中文包（po 注入后才存在，缺失只警告不阻断）
           if ! grep -q "^CONFIG_PACKAGE_luci-i18n-airoha-npu-zh-cn=y" .config; then
             echo "::warning::luci-i18n-airoha-npu-zh-cn 未启用（po/zh_Hans 未注入？界面将为英文）"
+          fi
+
+          # =========================================================
+          # 加密可选包复核（只警告不阻断）
+          #   defconfig 会把源码树里不存在的包当无效符号静默删掉。
+          #   PonWrt 基于 ImmortalWrt，kmod-crypto-hw-eip93 是否随
+          #   target/linux 的 crypto.mk 一起带过来取决于内核版本：
+          #   ≥6.18 走主线 inside-secure/eip93，<6.18 走 mtk-eip93，
+          #   两种都没有就整个包不存在。这里如实报，别让"编译成功"骗过去。
+          # =========================================================
+          echo "===== 加密可选包复核 ====="
+          if [ "${WANT_EIP93}" = "1" ] && ! grep -q "^CONFIG_PACKAGE_kmod-crypto-hw-eip93=y" .config; then
+            echo "::warning::kmod-crypto-hw-eip93 未编入 —— 当前源码树不带该包（内核版本或 target 不含 EIP93）。不影响其余构建。"
+          fi
+          if [ "${WANT_CHACHA}" = "1" ]; then
+            for p in kmod-crypto-lib-chacha20 kmod-crypto-chacha20poly1305; do
+              grep -q "^CONFIG_PACKAGE_${p}=y" .config \
+                && echo "  ✅ ${p}" \
+                || echo "::warning::${p} 未编入（源码树无此包符号，ChaCha 加速不生效）"
+            done
+          fi
+
+          # 内核符号复核：目标 kernel config 里应能看到我们写进去的项
+          KCFG="$(ls target/linux/airoha/${SUBTARGET:-${SOC}}/config-* 2>/dev/null | head -1)"
+          if [ "${WANT_ARM64CE}" = "1" ] && [ -n "$KCFG" ]; then
+            if grep -q '^CONFIG_CRYPTO_AES_ARM64=y' "$KCFG"; then
+              echo "  ✅ 内核符号已写入 ${KCFG}"
+            else
+              echo "::warning::${KCFG} 里没有 CONFIG_CRYPTO_AES_ARM64 —— diy-part2-crypto.sh 未生效（没被 source？路径不对？）"
+            fi
           fi
 
           # 机型校验: 机型名写错时直接失败，避免静默全编译
@@ -1055,6 +1154,7 @@ jobs:
             echo "| 分支 | \`${REPO_BRANCH}\` |"
             echo "| 提交 | \`$(cd "$BUILD_ROOT"/openwrt && git rev-parse --short HEAD)\` |"
             echo "| 编译时间 | $(date '+%Y-%m-%d %H:%M:%S') (Shanghai) |"
+            echo "| 加密加速 | ARM64CE=${OPT_CRYPTO_ARM64CE} / ChaCha=${OPT_CRYPTO_CHACHA} / EIP93=${OPT_CRYPTO_EIP93} |"
             echo ""
             echo "### 固件文件校验"
             echo '```'
