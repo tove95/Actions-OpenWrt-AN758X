@@ -233,7 +233,20 @@ jobs:
           persist-credentials: false
 
       # =========================================================
-      # 0. 解析机型 -> 自动校正 SoC，导出 device name
+      # 0. 行尾归一化（防御性）：把会被执行的脚本里的 CRLF 改成 LF。
+      #    若仓库里的脚本被以 CRLF 提交（Windows 提交 / 网页上传），
+      #    shebang 会变成 "#!/bin/bash\r" 而失效，CI 报 exit 127
+      #    "cannot execute: required file not found"。sed 幂等，无 CR 时不动。
+      # =========================================================
+      - name: Normalize line endings (CRLF -> LF)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          find . -path ./.git -prune -o -type f \
+            \( -name '*.sh' -o -path './files/*' \) -print0 \
+            | xargs -0 -r sed -i 's/\r$//' || true
+
+      # =========================================================
+      # 1. 解析机型 -> 自动校正 SoC，导出 device name
       # =========================================================
       - name: Resolve device profile
         id: resolve
@@ -1173,10 +1186,7 @@ jobs:
           # 固定 tag：机型 + 分支，不含时间戳、不含作者
           # 同一机型/分支再次编译时，softprops/action-gh-release 会更新
           # 这个已存在的 Release（同名固件自动覆盖），不会新建版本。
-          #RELEASE_TAG=$(echo "${DEVICE_NAME}-${REPO_BRANCH}" | sed 's/[^a-zA-Z0-9._-]/-/g')
-          # 改为动态 tag：机型 + 分支 + 时间戳，每次编译生成独立的 Release
-          BUILD_DATE=$(date '+%Y%m%d-%H%M')
-          RELEASE_TAG=$(echo "${DEVICE_NAME}-${REPO_BRANCH}-${BUILD_DATE}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          RELEASE_TAG=$(echo "${DEVICE_NAME}-${REPO_BRANCH}" | sed 's/[^a-zA-Z0-9._-]/-/g')
           echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
 
           touch release.txt
