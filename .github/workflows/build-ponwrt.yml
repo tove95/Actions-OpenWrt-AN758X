@@ -49,6 +49,13 @@ env:
   OPT_CRYPTO_CHACHA:  ${{ github.event.inputs.opt_chacha  == '1' && '1' || '0' }}
   OPT_CRYPTO_EIP93:   ${{ github.event.inputs.opt_eip93   == '1' && '1' || '0' }}
 
+  # ---- SONiC fullcone NAT ----
+  # 运行时 git clone 上游补丁仓库（mufeng05/openwrt-sonic-fullcone）并打补丁，
+  # 替换 ponwrt 自带的 kmod-nft-fullcone（两套实现互斥）。
+  # 与其它开关同理：显式选 false → 'false'（非空字符串为真，不会被 || 吃掉）；
+  # repository_dispatch 下 inputs 为空 → 回退 'true'。
+  APPLY_SONIC_FULLCONE: ${{ github.event.inputs.sonic_fullcone || 'true' }}
+
   # ---- FTTR 相关仓库 ----
   # 填 none = 本次不拉这些仓库，FTTR 相关包整体跳过
   # 两个仓库的可见性不保证一致（当前：luci 公开、后端私有），所以运行时
@@ -132,6 +139,18 @@ on:
         options:
           - '0'
           - '1'
+
+      # ---------- SONiC fullcone NAT ----------
+      # true  = 运行时 git clone 上游补丁仓库，用 SONiC 全锥形 NAT 替换自带 fullcone
+      # false = 不拉取、不打补丁，保留 ponwrt 自带的 kmod-nft-fullcone
+      sonic_fullcone:
+        description: 'SONiC fullcone NAT（true=克隆上游补丁替换自带 fullcone；false=保留自带 fullcone）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
       scope:
         description: '构建范围 (toolchain-only 仅预热工具链缓存)'
@@ -597,6 +616,22 @@ jobs:
 
 
       # =========================================================
+      # 5.5 应用 SONiC fullcone NAT 补丁
+      #     add_sonic_fullcone.sh 运行时 git clone 上游补丁仓库
+      #     (mufeng05/openwrt-sonic-fullcone)，复制补丁到源码树；
+      #     并先移除 ponwrt/immortalwrt 自带的 fullcone（独立 nft_fullcone.ko），
+      #     避免与 sonic 的内核补丁（改 nf_nat_core / nft_masq）冲突。
+      #     开关 sonic_fullcone=false 时整步跳过，保留自带 fullcone。
+      # =========================================================
+      - name: Apply SONiC fullcone NAT patches (git clone upstream)
+        if: env.APPLY_SONIC_FULLCONE == 'true'
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          chmod +x "$GITHUB_WORKSPACE/scripts/add_sonic_fullcone.sh"
+          "$GITHUB_WORKSPACE/scripts/add_sonic_fullcone.sh"
+
+
+      # =========================================================
       # 6. 加载 .config —— 源码基座 defconfig 打底 + 机型精简配置追加
       # =========================================================
       - name: Load custom configuration
@@ -668,6 +703,7 @@ jobs:
           FW_AUTHOR="$FW_AUTHOR" FW_BUILD_TIME="$FW_BUILD_TIME" FW_DESC_SUFFIX="$FW_DESC_SUFFIX" \
           WIFI_5G_COUNTRY="$WIFI_5G_COUNTRY" WIFI_5G_CHANNEL="$WIFI_5G_CHANNEL" \
           WIFI_5G_HTMODE="$WIFI_5G_HTMODE" WIFI_5G_FALLBACK="$WIFI_5G_FALLBACK" \
+          APPLY_SONIC_FULLCONE="$APPLY_SONIC_FULLCONE" \
             "$GITHUB_WORKSPACE/$DIY_P2_SH"
 
           # 可选包是否被 defconfig 接受，要等步骤 9 之后才知道；
@@ -1137,12 +1173,8 @@ jobs:
           # 固定 tag：机型 + 分支，不含时间戳、不含作者
           # 同一机型/分支再次编译时，softprops/action-gh-release 会更新
           # 这个已存在的 Release（同名固件自动覆盖），不会新建版本。
-          #RELEASE_TAG=$(echo "${DEVICE_NAME}-${REPO_BRANCH}" | sed 's/[^a-zA-Z0-9._-]/-/g')
-          # 改为动态 tag：机型 + 分支 + 时间戳，每次编译生成独立的 Release
-          BUILD_DATE=$(date '+%Y%m%d-%H%M')
-          RELEASE_TAG=$(echo "${DEVICE_NAME}-${REPO_BRANCH}-${BUILD_DATE}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          RELEASE_TAG=$(echo "${DEVICE_NAME}-${REPO_BRANCH}" | sed 's/[^a-zA-Z0-9._-]/-/g')
           echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
-          
 
           touch release.txt
           {
