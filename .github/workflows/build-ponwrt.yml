@@ -272,20 +272,7 @@ jobs:
           fi
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-# =========================================================
-      # 4.5 禁用 Python3 PGO（交叉编译兼容修复）
-      #     Python 3.14+ 默认开启 --enable-optimizations (PGO)，
-      #     但 OpenWrt 交叉编译环境下缺少 host Python 会导致
-      #     configure 报错 "Cross compiling requires --with-build-python"。
-      #     直接删除该行比注释更安全，避免破坏 Makefile 续行结构。
-      # =========================================================
-      - name: Patch Python3 to disable PGO
-        run: |
-          sed -i '/--enable-optimizations/d' feeds/packages/lang/python/python3/Makefile
-          ! grep -q 'enable-optimizations' feeds/packages/lang/python/python3/Makefile && echo "✅ Python3 PGO disabled successfully" || echo "::warning::Python3 PGO patch failed"
 
-
-          
       # =========================================================
       # 5. diy-part1.sh —— 拉取可选插件
       # =========================================================
