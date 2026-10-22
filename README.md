@@ -329,3 +329,21 @@ lsmod | grep eip93
 - Xray / sing-box 本身不在官方 feed，得先在 `feeds.conf.default` 加第三方源。用户态加密提速靠 ChaCha，不是靠 EIP93。
 - NPU 只在三层路由模式生效，当纯 AP 桥接时整机吞吐会掉到 2000 Mbps 左右——这跟加密无关，但经常一起被误判。
 
+---
+
+## SONiC fullcone NAT（全锥形 NAT）
+
+本项目 = `Actions-OpenWrt-AN758X`（qaqma 分支）合并
+[mufeng05/openwrt-sonic-fullcone](https://github.com/mufeng05/openwrt-sonic-fullcone)：
+编译时**云端拉取**上游补丁仓库并打补丁，把 SONiC 的 fullcone NAT 内核补丁移植进 ponwrt，
+替换源码自带的 `kmod-nft-fullcone`（两套实现互斥）。
+
+- 开关：workflow 输入 `sonic_fullcone`，默认 `true`。
+  - `true`（默认）：`scripts/add_sonic_fullcone.sh` 运行时 `git clone` 上游仓库，
+    先移除自带 `fullconenat*` 源码包与配套补丁，再复制 SONiC 补丁到源码树；
+    `diy-part2.sh` 同时从 `.config` 剥离自带 fullcone 包符号。
+  - `false`：完全不拉取、不打补丁，保留 ponwrt 自带 `kmod-nft-fullcone`。
+- 上游仓库/分支可用环境变量覆盖：`SONIC_FULLCONE_REPO` / `SONIC_FULLCONE_REF`。
+- 配置：刷机后在「网络 → 防火墙」开启全局 fullcone，再对 wan zone 勾选；
+  或 UCI：`uci set firewall.@defaults[0].fullcone='1'`、`uci set firewall.@zone[1].fullcone='1'`。
+

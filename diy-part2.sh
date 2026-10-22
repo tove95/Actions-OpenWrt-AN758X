@@ -255,4 +255,22 @@ fi
 # 加密是可选增强，不该有能力搞挂构建。
 [ -f scripts/diy-part2-crypto.sh ] && . ./scripts/diy-part2-crypto.sh || true
 
+# ---------------------------------------------------------
+# 6. SONiC fullcone：剥离源码基座里自带的 fullcone 包符号
+#
+#    ponwrt 源码基座 configs/an7581.config、an7583.config 里有
+#    CONFIG_PACKAGE_kmod-nft-fullcone=y，编出的是独立的 nft_fullcone.ko，
+#    与 sonic 的内核补丁（改 nf_nat_core / nft_masq）互斥。
+#    补丁层面已由 scripts/add_sonic_fullcone.sh 拆掉自带源码包，
+#    这里再从已加载的 .config 里剥离对应符号，避免 defconfig 反复告警。
+#    APPLY_SONIC_FULLCONE != true 时不动 .config。
+# ---------------------------------------------------------
+if [ "${APPLY_SONIC_FULLCONE:-true}" = "true" ] && [ -f .config ]; then
+  for sym in kmod-nft-fullcone kmod-ipt-fullconenat iptables-mod-fullconenat; do
+    sed -i "/^CONFIG_PACKAGE_${sym}=/d; /^# CONFIG_PACKAGE_${sym} is not set/d" .config
+    echo "# CONFIG_PACKAGE_${sym} is not set  # 由 SONiC fullcone 取代" >> .config
+    echo "✅ 已剥离自带 fullcone 包符号: ${sym}"
+  done
+fi
+
 echo "🎉 diy-part2.sh 执行完毕 (author=$FW_AUTHOR)"
