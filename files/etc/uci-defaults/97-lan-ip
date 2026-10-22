@@ -1,0 +1,10 @@
+#!/bin/sh
+# 默认管理地址 192.168.1.1 -> 192.168.5.1
+# 由 diy 定制注入：首次开机（及升级保留配置时）由 uci-defaults 执行一次后自动删除
+
+uci -q batch <<'UCI'
+set network.lan.ipaddr='192.168.5.1'
+set network.lan.netmask='255.255.255.0'
+commit network
+UCI
+exit 0
