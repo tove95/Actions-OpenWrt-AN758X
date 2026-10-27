@@ -1,0 +1,581 @@
+name: Warm Build Cache (staging_dir)
+
+# =========================================================
+# 预热「整体构建缓存」—— 参照 VIKINGYFY/OpenWRT-CI 的做法
+#
+#   缓存整个 staging_dir（host 工具 + 交叉编译器 + hostpkg 的 Go
+#   + target-*/host 的 Rust），靠指纹决定是否复用，恢复后 touch
+#   全部 stamp；dl 与 .ccache 长期累计。
+#
+#   与之前「挑 go / rust 产物打包」那套的区别：
+#     - 不猜产物位置（整目录收）
+#     - 不单独处理 build_dir 的 .built（整目录的 stamp 已包含）
+#     - 不按机型判断要不要编 golang（一律编全，全 subtarget 共享）
+#
+#   ★ key 里只有 TARGET / SUBTARGET，没有机型名，
+#     所以同一 subtarget 下的所有机型共享一份。
+#
+# 通道：actions/cache（快，但 7 天未命中即淘汰）+ Release（长期兜底）
+# =========================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      soc:
+        description: 'SoC（决定 subtarget；同 subtarget 的所有机型共享一份缓存）'
+        required: true
+        default: 'an7581'
+        type: choice
+        options:
+          - an7581
+          - an7583
+          - both
+      source:
+        description: '编译源码仓库'
+        required: true
+        default: 'pbs05/ponwrt'
+        type: choice
+        options:
+          - pbs05/ponwrt
+          - fork
+      branch:
+        description: 'ponwrt 源码分支'
+        required: true
+        default: 'master'
+      force:
+        description: '忽略已有缓存，强制重编'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      upload_release:
+        description: '额外存一份到 Release（长期兜底；>2GB 会失败但仍写 actions/cache）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  schedule:
+    # 每周一 03:17（UTC）跑一次，给上游升级后自动续上缓存
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: write
+
+env:
+  BUILD_ROOT: /workdir
+  # ⚠ SOURCE 必须定义：dl / ccache 的 key 用到它。
+  #   漏了的话 key 会变成 ponwrt-dl--master-202644（两个连字符），
+  #   与主流程的 ponwrt-dl-pbs05/ponwrt-master-... 对不上，等于每次冷下。
+  SOURCE: ${{ github.event.inputs.source || 'pbs05/ponwrt' }}
+  REPO_URL: ${{ github.event.inputs.source == 'fork' && 'https://github.com/qwe3017/ponwrt' || 'https://github.com/pbs05/ponwrt' }}
+  REPO_BRANCH: ${{ github.event.inputs.branch || 'master' }}
+  FEEDS_CONF: ''
+  DIY_P1_SH: diy-part1.sh
+  USE_DL_CACHE: true
+  TZ: Asia/Shanghai
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+  # ⚠ actions/cache 的 with.path 不接受 GITHUB_ENV 动态值，必须 workflow 级静态
+  STAGING_CACHE_DIR: /workdir/staging-cache
+  HOST_RELEASE_BACKUP: ${{ github.event.inputs.upload_release == 'false' && 'false' || 'true' }}
+  FORCE_REBUILD: ${{ github.event.inputs.force == 'true' && 'true' || 'false' }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Build matrix
+        id: matrix
+        run: |
+          SOC="${{ github.event.inputs.soc || 'an7581' }}"
+          case "$SOC" in
+            both)   LIST='["an7581","an7583"]' ;;
+            an7583) LIST='["an7583"]' ;;
+            *)      LIST='["an7581"]' ;;
+          esac
+          echo "matrix={\"soc\":$LIST}" >> "$GITHUB_OUTPUT"
+          echo "SoC 列表: $LIST"
+
+      - name: Ensure staging-cache release exists
+        if: env.HOST_RELEASE_BACKUP == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view staging-cache --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create staging-cache --repo "$GITHUB_REPOSITORY" \
+              --title "Staging Build Cache" \
+              --notes "staging_dir 整体构建缓存，由 warm-cache.yml 自动生成，请勿手动删除" \
+              --latest=false
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+      max-parallel: 2
+
+    env:
+      SOC: ${{ matrix.soc }}
+      PROFILE: all
+      CONFIG_FILE: configs/${{ matrix.soc }}.config
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Free disk space & init build environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/lib/jvm \
+            /usr/local/share/powershell /usr/share/swift 2>/dev/null || true
+          sudo docker image prune --all --force 2>/dev/null || true
+
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile && sudo swapon /swapfile
+
+          sudo -E apt-get -yqq update
+          sudo -E apt-get -yqq install build-essential clang llvm dwarves \
+            libssl-dev libelf-dev bc flex bison python3 python3-distutils \
+            xz-utils tar unzip zip zstd dos2unix gettext \
+            rsync file wget curl git subversion 2>/dev/null || true
+
+          if [ -x "$GITHUB_WORKSPACE/scripts/init_build_environment.sh" ]; then
+            bash "$GITHUB_WORKSPACE/scripts/init_build_environment.sh" || true
+          else
+            sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)' || true
+          fi
+
+          sudo -E apt-get -yqq autoremove --purge
+          sudo -E apt-get -yqq clean
+          sudo -E timedatectl set-timezone "$TZ"
+
+          sudo mkdir -p /workdir
+          sudo chown "$USER":"$USER" /workdir
+
+          echo "磁盘:"; df -hT /workdir
+          echo "内存:"; free -h
+
+      - name: Clone source code
+        run: |
+          cd "$BUILD_ROOT"
+          git clone "$REPO_URL" -b "$REPO_BRANCH" --single-branch --depth=1 openwrt
+          ln -sf "$BUILD_ROOT/openwrt" "$GITHUB_WORKSPACE/openwrt"
+          cd openwrt && echo "commit: $(git rev-parse --short HEAD)"
+
+      # =========================================================
+      # ⚠ 周号必须先算成 step output。
+      #
+      #   原来直接把 $(date +%Y%W) 写进 with: key:，那是【错的】——
+      #   with: 下面没有 shell，命令替换不会执行，key 会原样变成
+      #     ponwrt-dl-pbs05/ponwrt-master-$(date +%Y%W)
+      #   于是每次都写一份名字带美元符号的垃圾条目，
+      #   与主流程真正的 ponwrt-dl-...-202644 永远对不上。
+      #   （跟之前 GO_DEFAULT_VERSION 那个坑是同一类。）
+      # =========================================================
+      - name: Compute week number
+        id: week
+        run: echo "week=$(date +%Y%W)" >> "$GITHUB_OUTPUT"
+
+      # dl：长期累计。key 按周，前缀回退能拿到前几周的内容，
+      # 每跑一次都把新下载的包并进去再存，于是越滚越全。
+      - name: Restore dl cache
+        if: env.USE_DL_CACHE == 'true'
+        uses: actions/cache@v5
+        continue-on-error: true
+        with:
+          path: /workdir/openwrt/dl
+          key: ponwrt-dl-${{ env.SOURCE }}-${{ github.event.inputs.branch || 'master' }}-${{ steps.week.outputs.week }}
+          restore-keys: |
+            ponwrt-dl-${{ env.SOURCE }}-${{ github.event.inputs.branch || 'master' }}-
+          save-always: true
+
+      - name: Restore ccache
+        uses: actions/cache@v5
+        continue-on-error: true
+        with:
+          path: /workdir/openwrt/.ccache
+          key: ponwrt-ccache-${{ matrix.soc }}-${{ steps.week.outputs.week }}
+          restore-keys: |
+            ponwrt-ccache-${{ matrix.soc }}-
+
+      - name: Update & install feeds
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          if [ -n "${FEEDS_CONF}" ] && [ -e "$GITHUB_WORKSPACE/${FEEDS_CONF}" ]; then
+            cp "$GITHUB_WORKSPACE/${FEEDS_CONF}" feeds.conf.default
+          fi
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Pull optional plugins (diy-part1.sh)
+        continue-on-error: true
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          chmod +x "$GITHUB_WORKSPACE/$DIY_P1_SH"
+          "$GITHUB_WORKSPACE/$DIY_P1_SH"
+
+      - name: Load configuration
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          if [ -f "configs/${SOC}.config" ]; then
+            cp "configs/${SOC}.config" .config
+            echo "✅ 使用 configs/${SOC}.config"
+          elif [ -e "$GITHUB_WORKSPACE/${CONFIG_FILE}" ]; then
+            cp "$GITHUB_WORKSPACE/${CONFIG_FILE}" .config
+            echo "✅ 使用仓库内 ${CONFIG_FILE}"
+          else
+            echo "::error::找不到 ${CONFIG_FILE}"
+            exit 1
+          fi
+          sed -i '/CONFIG_TARGET_DEVICE_/d; /^CONFIG_TARGET_MULTI_PROFILE=/d' .config
+          make defconfig 2>&1 | tail -5
+
+      # =========================================================
+      # 指纹 —— 决定「能不能整体复用」
+      #   上游提交 / 最终配置 / feeds / 自定义包 / 构建脚本，任一变化都换 key
+      # =========================================================
+      - name: Generate build cache fingerprint
+        id: fp
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          SCRIPT="$GITHUB_WORKSPACE/scripts/pwrt-cache.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::error::缺 $SCRIPT —— 请确认脚本已入仓"
+            exit 1
+          fi
+          dos2unix "$SCRIPT" 2>/dev/null || true
+          chmod +x "$SCRIPT"
+          bash "$SCRIPT" fingerprint "$BUILD_ROOT/openwrt"
+
+      # =========================================================
+      # toolchain 缓存 key —— 与主流程 Generate toolchain cache key
+      # 【完全同口径】，这样两边才能命中同一条目。
+      #
+      #   注意口径比 staging 指纹窄得多：只算 tools/ toolchain/ 下的
+      #   Makefile 与 *.mk。上游新增软件包不会让它失效，所以这份缓存
+      #   比 staging 稳定得多，是 staging 未命中时的重要回退。
+      # =========================================================
+      - name: Generate toolchain cache key
+        id: tc-key
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          TARGET=$(grep '^CONFIG_TARGET_BOARD=' .config | cut -d'"' -f2)
+          SUBTARGET=$(grep '^CONFIG_TARGET_SUBTARGET=' .config | cut -d'"' -f2)
+          TOOLS_HASH=$(find tools toolchain -type f \( -name "Makefile" -o -name "*.mk" \) \
+            -exec md5sum {} + 2>/dev/null | sort | md5sum | cut -d' ' -f1)
+          CACHE_KEY="ponwrt-toolchain-${TARGET}-${SUBTARGET}-${TOOLS_HASH:0:16}"
+          echo "CACHE_KEY=$CACHE_KEY" >> "$GITHUB_OUTPUT"
+          echo "toolchain 缓存 Key: $CACHE_KEY"
+
+      # =========================================================
+      # 恢复（双通道）：actions/cache → Release → 解压+touch
+      # =========================================================
+      - name: Restore staging from actions/cache
+        id: staging-restore
+        if: env.FORCE_REBUILD != 'true'
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: /workdir/staging-cache
+          # ⚠ 不做前缀回退：指纹变了说明内容已变，用旧的是错的
+          key: ${{ steps.fp.outputs.STAGING_KEY }}
+
+      - name: Restore staging from Release backup
+        id: staging-release-restore
+        if: >-
+          env.FORCE_REBUILD != 'true'
+          && env.HOST_RELEASE_BACKUP == 'true'
+          && steps.staging-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$STAGING_CACHE_DIR"
+          KEY='${{ steps.fp.outputs.STAGING_KEY }}'
+          ASSET="${KEY}.tzst"
+          if gh release view staging-cache --repo "$GITHUB_REPOSITORY" \
+               --json assets -q '.assets[].name' 2>/dev/null | grep -qx "$ASSET"; then
+            gh release download staging-cache --repo "$GITHUB_REPOSITORY" -p "$ASSET" -D "$STAGING_CACHE_DIR"
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 已从 Release 下载 $ASSET"
+          else
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "Release 中没有 $ASSET"
+          fi
+
+      - name: Unpack staging dir
+        id: staging-unpack
+        if: env.FORCE_REBUILD != 'true'
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          STAGING_KEY='${{ steps.fp.outputs.STAGING_KEY }}' \
+            bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" unpack "$BUILD_ROOT/openwrt"
+
+      # =========================================================
+      # ★ staging 未命中 → 退而复用主流程的 toolchain 缓存
+      #
+      #   这份缓存由主流程 scope=toolchain-only（或任意一次跑完
+      #   Handle toolchain 的运行）生成，含 host 工具 + 交叉编译器，
+      #   能省掉 1~1.5 小时的 tools/toolchain 编译。
+      #   它不含 golang / rustc（那是 staging 多出来的部分），
+      #   所以命中后 Build host golang / rust 仍需照跑。
+      #
+      #   ⚠ path 必须与主流程【完全一致】：主流程存的是
+      #     staging_dir/host* 和 staging_dir/tool* 这两个通配目录
+      #     （不是打包的 tzst）。写成精确路径会对不上。
+      #
+      #   只在 staging 未命中时才试，命中就别浪费时间下载了。
+      # =========================================================
+      - name: Restore toolchain from actions/cache
+        id: tc-restore
+        if: >-
+          env.FORCE_REBUILD != 'true'
+          && steps.staging-unpack.outputs.unpacked != 'true'
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: |
+            ${{ env.BUILD_ROOT }}/openwrt/staging_dir/host*
+            ${{ env.BUILD_ROOT }}/openwrt/staging_dir/tool*
+          key: ${{ steps.tc-key.outputs.CACHE_KEY }}
+
+      - name: Restore toolchain from Release backup
+        id: tc-release-restore
+        if: >-
+          env.FORCE_REBUILD != 'true'
+          && steps.staging-unpack.outputs.unpacked != 'true'
+          && steps.tc-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          CACHE_KEY="${{ steps.tc-key.outputs.CACHE_KEY }}"
+          ASSET_NAME="${CACHE_KEY}.tzst"
+
+          if ! gh release view toolchain-cache --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "toolchain-cache Release 不存在"
+            exit 0
+          fi
+
+          # tzst 需要 unzstd；runner 未预装时先装，避免「假命中」后解压失败
+          which unzstd >/dev/null 2>&1 || sudo -E apt-get -yqq install zstd >/dev/null 2>&1 || true
+
+          if gh release view toolchain-cache --repo "$GITHUB_REPOSITORY" \
+               --json assets -q '.assets[].name' 2>/dev/null | grep -qx "$ASSET_NAME"; then
+            echo "从 Release 下载工具链: $ASSET_NAME"
+            gh release download toolchain-cache --repo "$GITHUB_REPOSITORY" -p "$ASSET_NAME" -D .
+            tar -I unzstd -xf "$ASSET_NAME" || tar -xf "$ASSET_NAME"
+            rm -f "$ASSET_NAME"
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "Release 中无匹配的 toolchain 缓存"
+          fi
+
+      # =========================================================
+      # touch：两条通道恢复出来的内容都要刷新 stamp，
+      # 否则 make 认为「源码比产物新」而全部重编。
+      # =========================================================
+      - name: Touch toolchain stamps
+        if: >-
+          steps.tc-restore.outputs.cache-hit == 'true'
+          || steps.tc-release-restore.outputs.restored == 'true'
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          find staging_dir -path '*/stamp/*' -type f -exec touch {} + 2>/dev/null || true
+          find staging_dir/host/bin staging_dir/toolchain*/bin -type f -exec touch {} + 2>/dev/null || true
+          touch tools/stamp-compile toolchain/stamp-compile 2>/dev/null || true
+
+      # =========================================================
+      # 判断是否需要重编（★ 自愈的关键）
+      #
+      #   ⚠ 原写法是「编译完再校验，缺了就 exit 1」。问题是：
+      #     staging 命中 → 跳过编译 → 校验发现缓存残缺 → exit 1 →
+      #     Pack 不跑、缓存永远修不好，下次还是命中同一份坏缓存。
+      #
+      #   改成在编译【之前】判断，并把结论交给后面的编译步骤：
+      #     need_rebuild=true  → 真编译（自愈）
+      #     need_rebuild=false → 跳过
+      #
+      #   判据是三件套齐全：host gcc、go、rustc。缺任一个就要重编。
+      # =========================================================
+      - name: Check if rebuild needed
+        id: need
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          MISSING=""
+
+          [ -x staging_dir/host/bin/gcc ] || MISSING="$MISSING gcc"
+
+          # go：OpenWrt 装在 lib/go-<ver>/bin/go，不是 bin/go
+          if ! find staging_dir -path '*/bin/go' -type f 2>/dev/null | grep -q .; then
+            MISSING="$MISSING go"
+          fi
+
+          if ! find staging_dir -path '*/bin/rustc' -type f 2>/dev/null | grep -q .; then
+            MISSING="$MISSING rustc"
+          fi
+
+          if [ -n "$MISSING" ]; then
+            echo "need_rebuild=true" >> "$GITHUB_OUTPUT"
+            echo "缺少:$MISSING → 需要重编"
+          else
+            echo "need_rebuild=false" >> "$GITHUB_OUTPUT"
+            echo "✅ 三件套齐全（gcc / go / rustc），跳过编译"
+          fi
+          staging_dir/host/bin/gcc --version 2>/dev/null | head -1 || true
+          ls -d staging_dir/toolchain* 2>/dev/null | head -2 || true
+
+      # =========================================================
+      # 编译：命中就整段跳过
+      #   tools/install  → host 工具（含 gcc）
+      #   toolchain/install → 交叉编译器（rust 需要它）
+      #   golang / rust 的 host 包
+      # =========================================================
+      - name: Build tools and toolchain
+        if: >-
+          steps.need.outputs.need_rebuild != 'false'
+          && steps.tc-restore.outputs.cache-hit != 'true'
+          && steps.tc-release-restore.outputs.restored != 'true'
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          make tools/download -j"$(nproc)" || echo "::warning::tools/download 有告警"
+          make tools/install -j"$(nproc)" || make tools/install -j1 V=s || {
+            echo "::error::tools 编译失败"; exit 1; }
+          make toolchain/download -j"$(nproc)" || echo "::warning::toolchain/download 有告警"
+          make toolchain/install -j"$(nproc)" || make toolchain/install -j1 V=s || {
+            echo "::error::toolchain 编译失败"; exit 1; }
+          touch tools/stamp-compile toolchain/stamp-compile 2>/dev/null || true
+
+      - name: Build host golang / rust
+        if: steps.need.outputs.need_rebuild != 'false'
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          JOBS=$(nproc)
+          # ★ 一律编全，不看机型配置：缓存是 subtarget 级共享的，
+          #   一次编好给该 subtarget 下所有机型用。
+          for p in golang-bootstrap golang rust; do
+            # ⚠ -L 必须有。package/feeds/packages/* 是指向 feeds/packages/lang/*
+            #   的符号链接，find 默认(-P)不跟随，且 -type d 不匹配符号链接本身，
+            #   结果连 package/feeds/packages/golang 都找不到 —— 三个包全被跳过。
+            rel=$(find -L package -maxdepth 4 -type d -name "$p" 2>/dev/null | head -1)
+            [ -z "$rel" ] && { echo "::warning::树里没有 $p，跳过"; continue; }
+            echo "===== make $rel/host/compile ====="
+            make "$rel/download" >/dev/null 2>&1 || true
+            # 不加 V=s：golang bootstrap 有 9000+ 个包，会刷上万行日志
+            make "$rel/host/compile" -j"$JOBS" || make "$rel/host/compile" -j1 V=s || \
+              echo "::warning::$p host 编译失败（其余继续）"
+
+            # 落地校验：make 返回 0 不等于真编出了东西。
+            #   包已 installed、没有 HostBuild、target 名对不上，make 都会安静返回 0。
+            #   不校验的话缓存里可能根本没有 go / rustc，而日志一片"成功"。
+            case "$p" in
+              rust) BIN=rustc ;;
+              *)    BIN=go   ;;
+            esac
+            if ! find staging_dir -path "*/bin/$BIN" -type f 2>/dev/null | grep -q .; then
+              echo "::warning::$p: make 返回 0，但 staging_dir 里没有 $BIN"
+            else
+              echo "✅ $p 产物已就位"
+            fi
+          done
+          touch tools/stamp-compile toolchain/stamp-compile 2>/dev/null || true
+
+
+      # ⚠ 条件用 need_rebuild 而不是 unpacked：
+      #   staging 命中但内容残缺时 unpacked=true，按原条件会跳过打包，
+      #   于是重编出来的正确内容永远存不回去 —— 自愈失效。
+      #   只要本次真的编译过（need_rebuild != false）就该重新打包。
+      - name: Pack staging dir
+        id: pack
+        if: steps.need.outputs.need_rebuild != 'false'
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          STAGING_KEY='${{ steps.fp.outputs.STAGING_KEY }}' \
+          STAGING_CACHE_DIR="$STAGING_CACHE_DIR" \
+            bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" pack "$BUILD_ROOT/openwrt"
+
+      - name: Save staging to actions/cache
+        if: >-
+          steps.pack.outputs.packed == 'true'
+          || steps.staging-release-restore.outputs.restored == 'true'
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: /workdir/staging-cache
+          key: ${{ steps.fp.outputs.STAGING_KEY }}
+
+      - name: Save staging to Release backup
+        if: >-
+          env.HOST_RELEASE_BACKUP == 'true'
+          && steps.pack.outputs.packed == 'true'
+          && steps.staging-release-restore.outputs.restored != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          KEY='${{ steps.fp.outputs.STAGING_KEY }}'
+          PREFIX='${{ steps.fp.outputs.STAGING_PREFIX }}'
+          TARBALL="$STAGING_CACHE_DIR/${KEY}.tzst"
+          [ -f "$TARBALL" ] || { echo "::warning::没有 $TARBALL"; exit 0; }
+          SZ=$(stat -c%s "$TARBALL")
+          if [ "$SZ" -lt 1024 ]; then
+            echo "::warning::$TARBALL 只有 ${SZ} 字节，跳过上传"; exit 0
+          fi
+
+          # 清掉同前缀的旧资产（指纹变了 key 就变，旧的没用了）
+          gh release view staging-cache --repo "$GITHUB_REPOSITORY" --json assets \
+            -q '.assets[].name' 2>/dev/null | grep "^${PREFIX}" | while read -r old; do
+              gh release delete-asset staging-cache "$old" --repo "$GITHUB_REPOSITORY" -y 2>/dev/null || true
+            done
+
+          gh release upload staging-cache "$TARBALL" --repo "$GITHUB_REPOSITORY" --clobber
+          ls -lh "$TARBALL"
+
+      - name: Cache status
+        if: always()
+        continue-on-error: true
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          mkdir -p "$GITHUB_WORKSPACE/build-reports"
+          REPORT_DIR="$GITHUB_WORKSPACE/build-reports" \
+            bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" status "$BUILD_ROOT/openwrt"
+
+      - name: Upload cache report
+        if: always()
+        uses: actions/upload-artifact@v5
+        continue-on-error: true
+        with:
+          name: staging-cache-${{ matrix.soc }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/build-reports/
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Staging Build Cache — ${{ matrix.soc }}"
+            echo ""
+            echo "- Key: \`${{ steps.fp.outputs.STAGING_KEY }}\`"
+            echo "- 指纹: \`${{ steps.fp.outputs.FP }}\`"
+            echo "- 命中: actions/cache=${{ steps.staging-restore.outputs.cache-hit || 'false' }} Release=${{ steps.staging-release-restore.outputs.restored || 'false' }}"
+            echo "- 本次编译: ${{ steps.staging-unpack.outputs.unpacked != 'true' && '是' || '否（已命中）' }}"
+            echo "- 打包: ${{ steps.pack.outputs.packed || 'n/a' }}"
+          } >> "$GITHUB_STEP_SUMMARY"

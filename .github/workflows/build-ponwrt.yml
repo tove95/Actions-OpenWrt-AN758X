@@ -19,6 +19,16 @@ env:
   UPLOAD_RELEASE: ${{ github.event.inputs.upload_release || 'true' }}
   USE_DL_CACHE: true
   USE_CCACHE: false
+  # ★ 整体构建缓存（staging_dir）—— 参照 VIKINGYFY/OpenWRT-CI
+  #   缓存整个 staging_dir：host 工具 + 交叉编译器 + hostpkg 的 Go + target-*/host 的 Rust。
+  #   由 warm-cache.yml 生产；本流程只消费。关掉即退回全程现场编译。
+  #   ⚠ 用 '== true/false' 显式兜底，不用 '||'：GitHub 表达式里非空串即真，
+  #     'false' 不会被判为假；repository_dispatch 下 inputs 为 null 也要有确定值。
+  USE_STAGING_CACHE: ${{ github.event.inputs.use_staging_cache == 'false' && 'false' || 'true' }}
+  # actions/cache 的 with.path 不接受 GITHUB_ENV 动态值，必须是 workflow 级静态
+  STAGING_CACHE_DIR: /workdir/staging-cache
+  # 除 actions/cache 外，是否再试 Release 备份（7 天淘汰规则的长期兜底）
+  STAGING_RELEASE_BACKUP: ${{ github.event.inputs.staging_release_backup == 'false' && 'false' || 'true' }}
   TZ: Asia/Shanghai
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   REPO_BRANCH: ${{ github.event.inputs.branch || 'master' }}
@@ -182,6 +192,25 @@ on:
         options:
           - 'false'
           - 'true'
+      # ---------- 整体构建缓存（★ 本次新增）----------
+      # choice + 字符串，不用 boolean：本 workflow 可被 repository_dispatch
+      # 触发，那种触发下 boolean 输入拿不到值会退化成空串。
+      use_staging_cache:
+        description: '使用 staging_dir 整体缓存（关 = 全程现场编译；缓存由 warm-cache.yml 生成）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      staging_release_backup:
+        description: 'staging 缓存也从 Release 恢复（actions/cache 7 天未命中会淘汰，Release 不会）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 # 最小权限：发布阶段需要 contents: write；清理阶段需要 actions: read/write
 permissions:
@@ -793,6 +822,31 @@ jobs:
           echo "========================================"
 
       # =========================================================
+      # 9.1 生成整体构建缓存指纹
+      #
+      #   ★ 必须在步骤 9 之后：要读 defconfig 展开后的 .config。
+      #
+      #   指纹 = 上游提交 + 最终配置 + feeds + 自定义包/脚本 + runner 架构。
+      #   任一变化都换 key —— 这是 OpenWRT-CI 那套「指纹一致才整体复用」的核心。
+      #   脚本没入仓时只 warning 跳过，绝不让构建死在 chmod 上。
+      # =========================================================
+      - name: Generate build cache fingerprint
+        id: fp
+        if: env.USE_STAGING_CACHE == 'true'
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          SCRIPT="$GITHUB_WORKSPACE/scripts/pwrt-cache.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::warning::缺 $SCRIPT，本次跳过整体构建缓存（走常规编译）"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          dos2unix "$SCRIPT" 2>/dev/null || true
+          chmod +x "$SCRIPT"
+          bash "$SCRIPT" fingerprint "$BUILD_ROOT/openwrt"
+
+      
+      # =========================================================
       # 9.5 下载工具链源码 —— 必须在编工具链之前
       #     报错 "Can't open dl/musl-1.2.6.tar.gz" 就是这一步缺失导致的：
       #     make toolchain/install 不会自动补下载，只会去解压 dl 里已有的包
@@ -884,10 +938,83 @@ jobs:
       # =========================================================
       # 12. 处理工具链
       # =========================================================
+      # =========================================================
+      # 19.1~19.3 恢复 staging_dir 整体缓存（双通道）
+      #
+      #   actions/cache（快，但 7 天未命中即淘汰）→ Release（长期兜底）
+      #   → 解压 + touch 全部 stamp。
+      #
+      #   ★ touch 是关键：OpenWrt 靠 mtime 判断依赖，tar 还原的是旧 mtime，
+      #     而源码树刚 clone（mtime 是现在）。不 touch 的话 make 认为
+      #     「源码比产物新」从而全部重编，缓存等于白命中。
+      # =========================================================
+      - name: Restore staging from actions/cache
+        id: staging-restore
+        if: >-
+          env.USE_STAGING_CACHE == 'true'
+          && env.IGNORE_CACHE != 'true'
+          && steps.fp.outputs.skip != 'true'
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: /workdir/staging-cache
+          # ⚠ 不做前缀回退：指纹变了说明内容已变，用旧的是错的
+          key: ${{ steps.fp.outputs.STAGING_KEY }}
+
+      - name: Restore staging from Release backup
+        id: staging-release-restore
+        if: >-
+          env.USE_STAGING_CACHE == 'true'
+          && env.IGNORE_CACHE != 'true'
+          && env.STAGING_RELEASE_BACKUP == 'true'
+          && steps.fp.outputs.skip != 'true'
+          && steps.staging-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$STAGING_CACHE_DIR"
+          KEY='${{ steps.fp.outputs.STAGING_KEY }}'
+          [ -z "$KEY" ] && { echo "restored=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          ASSET="${KEY}.tzst"
+          if gh release view staging-cache --repo "$GITHUB_REPOSITORY" \
+               --json assets -q '.assets[].name' 2>/dev/null | grep -qx "$ASSET"; then
+            gh release download staging-cache --repo "$GITHUB_REPOSITORY" -p "$ASSET" -D "$STAGING_CACHE_DIR"
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 已从 Release 下载 staging 缓存: $ASSET"
+          else
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "Release 中无匹配的 staging 缓存"
+          fi
+
+      - name: Unpack staging dir
+        id: staging-unpack
+        if: >-
+          env.USE_STAGING_CACHE == 'true'
+          && env.IGNORE_CACHE != 'true'
+          && steps.fp.outputs.skip != 'true'
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          STAGING_KEY='${{ steps.fp.outputs.STAGING_KEY }}' \
+          STAGING_CACHE_DIR="$STAGING_CACHE_DIR" \
+            bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" unpack "$BUILD_ROOT/openwrt"
+
+      
       - name: Handle toolchain
         id: toolchain
         run: |
           cd "$BUILD_ROOT/openwrt"
+
+          # ★ staging_dir 整体缓存命中 → host 工具链、交叉编译器、
+          #   golang / rustc 全在里面，一步都不用编。
+          if [ "${{ steps.staging-unpack.outputs.unpacked }}" = "true" ]; then
+            echo "✅ staging_dir 整体缓存命中，跳过 tools / toolchain 编译"
+            echo "need_build=false"        >> "$GITHUB_OUTPUT"
+            echo "need_save_cache=false"   >> "$GITHUB_OUTPUT"
+            echo "need_save_release=false" >> "$GITHUB_OUTPUT"
+            touch toolchain/stamp-compile tools/stamp-compile 2>/dev/null || true
+            exit 0
+          fi
 
           CACHE_HIT="${{ steps.cache-restore.outputs.cache-hit }}"
           RELEASE_HIT="${{ steps.release-restore.outputs.restored }}"
